@@ -1,4 +1,19 @@
 document.addEventListener('DOMContentLoaded', () => {
+  // Theme toggle
+  const themeToggle = document.getElementById('themeToggle');
+  const savedTheme = localStorage.getItem('theme');
+  if (savedTheme === 'dark') {
+    document.body.classList.add('dark-mode');
+    if (themeToggle) themeToggle.innerHTML = '<i class="bi bi-sun-fill"></i>';
+  }
+  if (themeToggle) {
+    themeToggle.addEventListener('click', () => {
+      document.body.classList.toggle('dark-mode');
+      const isDark = document.body.classList.contains('dark-mode');
+      localStorage.setItem('theme', isDark ? 'dark' : 'light');
+      themeToggle.innerHTML = isDark ? '<i class="bi bi-sun-fill"></i>' : '<i class="bi bi-moon-fill"></i>';
+    });
+  }
   const backButton = document.getElementById('backButton');
   if (backButton) {
     if (window.history.length <= 1) backButton.hidden = true;

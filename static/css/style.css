@@ -6,3 +6,23 @@
 :root{--ink:#0f172a;--muted:#64748b;--line:rgba(148,163,184,.22);--surface:rgba(255,255,255,.86);--bg:#f1f7fc;--primary:#2563eb;--primary-dark:#1d4ed8;--purple-soft:#eef2ff;--green:#10b981;--orange:#f59e0b;--red:#ef4444;--cyan:#06b6d4;--navy:#0f172a}.sidebar{background:linear-gradient(165deg,rgba(15,23,42,.99),rgba(18,39,76,.98));box-shadow:10px 0 32px rgba(15,23,42,.12);border-right:1px solid rgba(148,163,184,.12)}.brand-mark{background:linear-gradient(135deg,var(--primary),var(--cyan));box-shadow:0 7px 18px rgba(37,99,235,.28)}.sidebar nav a{border:1px solid transparent;transition:background .2s ease,border-color .2s ease,color .2s ease,transform .2s ease}.sidebar nav a.active,.sidebar nav a:hover{background:linear-gradient(100deg,rgba(37,99,235,.35),rgba(6,182,212,.16));border-color:rgba(96,165,250,.2);color:#fff;transform:translateX(2px)}
 .topbar{background:rgba(255,255,255,.76);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);border-bottom:1px solid rgba(148,163,184,.2);box-shadow:0 4px 20px rgba(15,23,42,.04)}.panel,.metric-card,.role-card,.resource-card,.profile-hero,.table-panel{background:var(--surface);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border:1px solid rgba(255,255,255,.75);box-shadow:0 10px 26px rgba(15,23,42,.055);border-radius:16px;transition:box-shadow .2s ease,transform .2s ease,border-color .2s ease}.panel:hover,.metric-card:hover,.role-card:hover,.resource-card:hover{border-color:rgba(96,165,250,.35);box-shadow:0 14px 32px rgba(37,99,235,.1);transform:translateY(-2px)}
 .metric-icon,.role-icon,.resource-icon{background:linear-gradient(135deg,rgba(37,99,235,.12),rgba(6,182,212,.12));color:var(--primary);border:1px solid rgba(37,99,235,.1)}.btn-primary{background:linear-gradient(135deg,#2563eb,#4f46e5);border-color:transparent;box-shadow:0 7px 16px rgba(37,99,235,.2);transition:transform .2s ease,box-shadow .2s ease}.btn-primary:hover,.btn-primary:focus{background:linear-gradient(135deg,#1d4ed8,#4338ca);border-color:transparent;box-shadow:0 9px 20px rgba(37,99,235,.28);transform:translateY(-1px)}.table-panel{overflow:hidden}.table tbody tr{transition:background .18s ease}.table tbody tr:hover{background:rgba(239,246,255,.72)}.progress{background:rgba(148,163,184,.18)}.progress span{background:linear-gradient(90deg,var(--primary),var(--cyan))}
+
+body.dark-mode{--ink:#e2e8f0;--muted:#94a3b8;--line:rgba(255,255,255,.1);--surface:rgba(15,23,42,.82);--bg:#0f172a}
+body.dark-mode::after{content:'';position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:0;pointer-events:none}
+body.dark-mode .app-shell,body.dark-mode main.main-content{position:relative;z-index:1}
+body.dark-mode .topbar{background:rgba(15,23,42,.85);border-color:rgba(255,255,255,.08)}
+body.dark-mode .panel,body.dark-mode .metric-card,body.dark-mode .role-card,body.dark-mode .resource-card,body.dark-mode .table-panel,body.dark-mode .profile-hero{background:rgba(15,23,42,.82);border-color:rgba(255,255,255,.1);color:var(--ink)}
+body.dark-mode .page-heading{background:rgba(15,23,42,.75);border-color:rgba(255,255,255,.1)}
+body.dark-mode .page-heading h1,body.dark-mode .page-heading p,body.dark-mode h1,body.dark-mode h2,body.dark-mode h3,body.dark-mode strong{color:var(--ink)}
+body.dark-mode input,body.dark-mode select,body.dark-mode textarea{background:rgba(255,255,255,.07);border-color:rgba(255,255,255,.15);color:#e2e8f0}
+body.dark-mode .btn-light{background:rgba(255,255,255,.08);border-color:rgba(255,255,255,.15);color:#e2e8f0}
+body.dark-mode .table{color:var(--ink)}
+body.dark-mode .table th{color:#94a3b8;border-color:rgba(255,255,255,.08)}
+body.dark-mode .table td{border-color:rgba(255,255,255,.06)}
+body.dark-mode .table tbody tr:hover{background:rgba(255,255,255,.05)}
+body.dark-mode .notification-panel{background:#1e293b;border-color:rgba(255,255,255,.1)}
+body.dark-mode .notification-item{border-color:rgba(255,255,255,.06)}
+body.dark-mode .config-row,.dark-mode .role-config{border-color:rgba(255,255,255,.07)}
+body.dark-mode .report-grid>div{background:rgba(255,255,255,.05)}
+body.dark-mode .analysis-summary{background:rgba(10,15,30,.9)}
+body.dark-mode .top-search{background:rgba(255,255,255,.06);border-color:rgba(255,255,255,.1);color:#94a3b8}
