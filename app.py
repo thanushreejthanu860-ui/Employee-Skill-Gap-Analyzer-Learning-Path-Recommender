@@ -438,6 +438,36 @@ def mark_assessment_reviewed(employee_id):
     return redirect(url_for("hr_assessment_review", employee_id=employee_id))
 
 
+@app.post("/hr/assessments/<int:employee_id>/action")
+def assessment_action(employee_id):
+    if not session.get("authenticated"):
+        return redirect(url_for("login", next=request.path))
+    action = request.form.get("action")
+    redirect_to = request.form.get("redirect_to", "assessments")
+    if action not in ("accept", "reject"):
+        flash("Invalid action.", "danger")
+        return redirect(url_for("hr_assessments"))
+    new_status = "Reviewed" if action == "accept" else "Rejected"
+    db = connect()
+    updated = db.execute("UPDATE assessment_requests SET status=? WHERE employee_id=? AND status='Completed'", (new_status, employee_id))
+    db.commit()
+    db.close()
+    employee = row("SELECT name FROM employees WHERE id=?", (employee_id,))
+    if updated.rowcount:
+        label = "accepted" if action == "accept" else "rejected"
+        flash(f"Assessment {label}.", "success")
+        create_notification(employee_id, "Employee", f"Assessment {label.capitalize()}", f"HR has {label} your submitted Skill Assessment.")
+    else:
+        flash("No completed assessment found to action.", "warning")
+    if redirect_to == "message":
+        message = row("SELECT id FROM messages WHERE sender_id=? AND sender_role='Employee' AND receiver_role='HR' ORDER BY id DESC LIMIT 1", (employee_id,))
+        if message:
+            return redirect(url_for("hr_message_view", message_id=message["id"]))
+    if redirect_to == "review":
+        return redirect(url_for("hr_assessments"))
+    return redirect(url_for("hr_assessments"))
+
+
 @app.get("/hr/assessments/<int:employee_id>/resume")
 def hr_assessment_resume(employee_id):
     if not session.get("authenticated"):
@@ -602,7 +632,7 @@ def learning_path_page(employee_id):
     role_id = int(request.args.get("role_id", roles[0]["id"])) if roles else None
     selected_employee = row("SELECT * FROM employees WHERE id=?", (employee_id,)) if employee_id else None
     selected_role = row("SELECT * FROM roles WHERE id=?", (role_id,)) if role_id else None
-    return render_template("learning_path.html", employees=employees, employee=selected_employee, roles=roles, selected_role=selected_role, path=learning_path(employee_id, role_id) if selected_employee and role_id else [], recommendations=recommendations(employee_id, role_id) if selected_employee and role_id else [])
+    return render_template("learning_path.html", employees=employees, employee=selected_employee, roles=roles, selected_role=selected_role, result=analyze(employee_id, role_id) if selected_employee and role_id else {}, path=learning_path(employee_id, role_id) if selected_employee and role_id else [], recommendations=recommendations(employee_id, role_id) if selected_employee and role_id else [], is_employee_view=False)
 
 
 @app.get("/hr/learning-path/<int:employee_id>")

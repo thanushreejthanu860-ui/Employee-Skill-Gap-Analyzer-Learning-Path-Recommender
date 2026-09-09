@@ -14,28 +14,14 @@
 body {
   position: relative;
   overflow-x: hidden;
-  background-color: #eaf5ff;
-  background-image: radial-gradient(circle at 84% -4%, rgba(82, 170, 235, .48), transparent 29%), radial-gradient(circle at 18% 110%, rgba(30, 205, 223, .22), transparent 32%), linear-gradient(120deg, rgba(255, 255, 255, .6), rgba(214, 237, 255, .42));
-  background-attachment: fixed;
-}
-
-body::before {
-  content: "";
-  position: fixed;
-  z-index: -1;
-  inset: 0;
-  pointer-events: none;
-  opacity: .28;
-  background-image: linear-gradient(rgba(255, 255, 255, .36) 1px, transparent 1px), linear-gradient(90deg, rgba(71, 144, 207, .12) 1px, transparent 1px);
-  background-size: 42px 42px;
-  mask-image: linear-gradient(to bottom, black, transparent 82%);
+  background: url('https://i.pinimg.com/1200x/1c/08/a1/1c08a17749ef69aeb0ad5e469f33d46f.jpg') center/cover fixed no-repeat;
 }
 
 .app-shell { position: relative; z-index: 1; }
 .sidebar {
   width: 214px;
   padding: 23px 12px;
-  background: linear-gradient(180deg, rgba(5, 29, 65, .98), rgba(10, 49, 97, .97));
+  background: url('https://i.pinimg.com/1200x/45/c0/86/45c08695ac7400476965367aababdd3b.jpg') center/cover no-repeat;
   border-right: 1px solid rgba(114, 190, 255, .18);
   box-shadow: 10px 0 34px rgba(14, 55, 103, .22);
 }
