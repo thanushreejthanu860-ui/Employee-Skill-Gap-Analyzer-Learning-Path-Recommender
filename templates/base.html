@@ -18,8 +18,8 @@
     <nav>
       <a href="{{ url_for('dashboard') }}" class="{% if request.endpoint == 'dashboard' %}active{% endif %}"><i class="bi bi-grid-1x2-fill"></i> Dashboard</a>
       <a href="{{ url_for('employees') }}" class="{% if request.endpoint in ['employees','employee_profile','add_employee','edit_employee'] %}active{% endif %}"><i class="bi bi-people-fill"></i> Employees <span class="nav-count">{{ nav_employee_count }}</span></a>
-      <a href="{{ url_for('matching_page', employee_id=1) }}"><i class="bi bi-bullseye"></i> Role matching</a>
-      <a href="{{ url_for('learning_path_page', employee_id=1) }}"><i class="bi bi-signpost-split-fill"></i> Learning paths</a>
+      <a href="{{ url_for('matching_page') }}"><i class="bi bi-bullseye"></i> Role matching</a>
+      <a href="{{ url_for('learning_path_page') }}"><i class="bi bi-signpost-split-fill"></i> Learning paths</a>
       <a href="{{ url_for('resources_page') }}"><i class="bi bi-collection-play-fill"></i> Resources</a>
       <div class="workspace-label mt-4">INSIGHTS</div>
       <a href="{{ url_for('analytics') }}"><i class="bi bi-bar-chart-fill"></i> Analytics & reports</a>
@@ -28,7 +28,7 @@
     <div class="sidebar-footer"><div class="avatar avatar-sm">HR</div><div><strong>HR workspace</strong><small>Demo account</small></div><a href="{{ url_for('logout') }}" class="icon-btn ms-auto" title="Log out" aria-label="Log out"><i class="bi bi-box-arrow-right"></i></a></div>
   </aside>
   <main class="main-content">
-    <header class="topbar"><button class="icon-btn d-lg-none" id="menuToggle"><i class="bi bi-list"></i></button><div class="crumb">Workspace <i class="bi bi-chevron-right"></i> <strong>{{ self.title() }}</strong></div><div class="top-actions"><button class="icon-btn"><i class="bi bi-search"></i></button><button class="icon-btn position-relative"><i class="bi bi-bell"></i><span class="notification-dot"></span></button><div class="avatar">HR</div></div></header>
+    <header class="topbar"><button class="icon-btn d-lg-none" id="menuToggle"><i class="bi bi-list"></i></button><div class="crumb">Workspace {% if request.endpoint != 'dashboard' %}<button class="back-button" id="backButton" type="button" title="Go back"><i class="bi bi-arrow-left"></i> Back</button>{% endif %}<i class="bi bi-chevron-right"></i> <strong>{{ self.title() }}</strong></div><div class="top-actions"><a class="icon-btn" href="{{ url_for('employees') }}" title="Search employees"><i class="bi bi-search"></i></a><div class="notification-wrap"><button class="icon-btn position-relative" id="notificationButton" type="button" title="Notifications"><i class="bi bi-bell"></i><span class="notification-dot"></span></button><div class="notification-panel" id="notificationPanel"><div class="notification-head"><strong>Notifications</strong><button class="text-button" id="markNotificationsRead" type="button">Mark all as read</button></div>{% for notification in notifications %}<div class="notification-item"><span class="notification-icon"><i class="bi bi-{{ notification.icon }}"></i></span><div><strong>{{ notification.title }}</strong><p>{{ notification.message }}</p><small>{{ notification.time }}</small></div></div>{% endfor %}</div></div><div class="avatar">HR</div></div></header>
     <div class="page-content">{% block content %}{% endblock %}</div>
   </main>
 </div>

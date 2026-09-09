@@ -60,7 +60,9 @@ def match_roles(employee_id):
     results = []
     for index, role in enumerate(roles):
         details = analyze(employee_id, role["id"])
-        results.append({"id": role["id"], "name": role["name"], "readiness": details["readiness"], "similarity": round(float(similarities[index]) * 100), "critical": details["critical"], "gap_count": len([item for item in details["gaps"] if item["gap"] > 0])})
+        matching_skills = [item["skill"] for item in details["gaps"] if item["gap"] == 0]
+        weak_skills = [item["skill"] for item in details["gaps"] if item["gap"] > 0]
+        results.append({"id": role["id"], "name": role["name"], "readiness": details["readiness"], "similarity": round(float(similarities[index]) * 100), "critical": details["critical"], "gap_count": len(weak_skills), "matching_skills": matching_skills, "weak_skills": weak_skills, "explanation": f"{employee['name']} matches {len(matching_skills)} required skills and needs development in {len(weak_skills)} skills for {role['name']}."})
     return sorted(results, key=lambda item: (item["readiness"], item["similarity"]), reverse=True)
 
 
@@ -83,7 +85,7 @@ def learning_path(employee_id, role_id):
     path = []
     for index, item in enumerate(ordered, 1):
         resource = rows("SELECT lr.name, lr.duration, lr.type FROM learning_resources lr JOIN skills s ON s.id = lr.skill_id WHERE s.name = ? ORDER BY CASE difficulty WHEN 'Beginner' THEN 1 WHEN 'Intermediate' THEN 2 ELSE 3 END LIMIT 1", (item["skill"],))
-        path.append({"step": index, "skill": item["skill"], "gap": item["gap"], "status": item["status"], "resource": resource[0] if resource else {"name": f"Build {item['skill']} capability", "duration": "Self-paced", "type": "Practice"}})
+        path.append({"step": index, "skill": item["skill"], "current": item["current"], "required": item["required"], "gap": item["gap"], "priority": "High" if item["gap"] > 40 else "Medium" if item["gap"] > 20 else "Low", "status": item["status"], "reason": f"{item['skill']} is a {item['status'].lower()} for this role, so it is prioritized from the employee's measured gap.", "resource": resource[0] if resource else {"name": f"Build {item['skill']} capability", "duration": "Self-paced", "type": "Practice"}})
     return path
 
 

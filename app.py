@@ -34,7 +34,7 @@ def save_employee(payload, employee_id=None):
 
 @app.context_processor
 def inject_globals():
-    return {"nav_employee_count": row("SELECT COUNT(*) AS count FROM employees")["count"]}
+    return {"nav_employee_count": row("SELECT COUNT(*) AS count FROM employees")["count"], "notifications": notifications_data()}
 
 
 @app.route("/")
@@ -70,8 +70,24 @@ def dashboard():
 @app.route("/employees")
 def employees():
     query = request.args.get("q", "").strip()
-    data = rows("SELECT * FROM employees WHERE name LIKE ? OR department LIKE ? ORDER BY name", (f"%{query}%", f"%{query}%"))
-    return render_template("employees.html", employees=data, query=query)
+    department = request.args.get("department", "").strip()
+    role = request.args.get("role", "").strip()
+    readiness = request.args.get("readiness", "").strip()
+    risk = request.args.get("risk", "").strip()
+    conditions = ["(e.name LIKE ? OR e.email LIKE ? OR CAST(e.id AS TEXT) LIKE ? OR e.department LIKE ? OR e.current_role LIKE ?)"]
+    params = [f"%{query}%"] * 5
+    if department: conditions.append("e.department = ?"); params.append(department)
+    if role: conditions.append("e.current_role = ?"); params.append(role)
+    data = rows(f"SELECT e.* FROM employees e WHERE {' AND '.join(conditions)} ORDER BY e.name", params)
+    default_role = row("SELECT id FROM roles ORDER BY id LIMIT 1")
+    if default_role:
+        evaluated = [(item, analyze(item["id"], default_role["id"])) for item in data]
+        if readiness == "ready": evaluated = [(item, result) for item, result in evaluated if result["readiness"] >= 70]
+        if readiness == "developing": evaluated = [(item, result) for item, result in evaluated if result["readiness"] < 70]
+        if risk == "high": evaluated = [(item, result) for item, result in evaluated if result["critical"] > 0]
+        if risk == "low": evaluated = [(item, result) for item, result in evaluated if result["critical"] == 0]
+        data = [item for item, _ in evaluated]
+    return render_template("employees.html", employees=data, query=query, filters={"department": department, "role": role, "readiness": readiness, "risk": risk}, departments=rows("SELECT DISTINCT department FROM employees ORDER BY department"), roles=rows("SELECT DISTINCT current_role AS name FROM employees WHERE current_role <> '' ORDER BY current_role"))
 
 @app.route("/employees/new", methods=["GET", "POST"])
 def add_employee():
@@ -102,13 +118,24 @@ def analysis_page(employee_id):
     selected_role = row("SELECT * FROM roles WHERE id=?", (role_id,)) if role_id else None
     return render_template("analysis.html", employee=employee, roles=roles, selected_role=selected_role, result=result)
 
+@app.route("/matching", defaults={"employee_id": None})
 @app.route("/matching/<int:employee_id>")
-def matching_page(employee_id): return render_template("matching.html", employee=row("SELECT * FROM employees WHERE id=?", (employee_id,)), matches=match_roles(employee_id))
+def matching_page(employee_id):
+    employees = rows("SELECT * FROM employees ORDER BY name")
+    employee_id = int(request.args.get("employee_id", employee_id or (employees[0]["id"] if employees else 0)))
+    selected = row("SELECT * FROM employees WHERE id=?", (employee_id,)) if employee_id else None
+    return render_template("matching.html", employees=employees, employee=selected, matches=match_roles(employee_id) if selected else [])
 
+@app.route("/learning-path", defaults={"employee_id": None})
 @app.route("/learning-path/<int:employee_id>")
 def learning_path_page(employee_id):
-    roles = rows("SELECT * FROM roles ORDER BY name"); role_id = int(request.args.get("role_id", roles[0]["id"])) if roles else None
-    return render_template("learning_path.html", employee=row("SELECT * FROM employees WHERE id=?", (employee_id,)), roles=roles, selected_role=row("SELECT * FROM roles WHERE id=?", (role_id,)) if role_id else None, path=learning_path(employee_id, role_id) if role_id else [], recommendations=recommendations(employee_id, role_id) if role_id else [])
+    employees = rows("SELECT * FROM employees ORDER BY name")
+    roles = rows("SELECT * FROM roles ORDER BY name")
+    employee_id = int(request.args.get("employee_id", employee_id or (employees[0]["id"] if employees else 0)))
+    role_id = int(request.args.get("role_id", roles[0]["id"])) if roles else None
+    selected_employee = row("SELECT * FROM employees WHERE id=?", (employee_id,)) if employee_id else None
+    selected_role = row("SELECT * FROM roles WHERE id=?", (role_id,)) if role_id else None
+    return render_template("learning_path.html", employees=employees, employee=selected_employee, roles=roles, selected_role=selected_role, path=learning_path(employee_id, role_id) if selected_employee and role_id else [], recommendations=recommendations(employee_id, role_id) if selected_employee and role_id else [])
 
 @app.route("/resources")
 def resources_page(): return render_template("resources.html", resources=rows("SELECT lr.*, s.name AS skill FROM learning_resources lr JOIN skills s ON s.id=lr.skill_id ORDER BY s.name, lr.name"), skills=rows("SELECT * FROM skills ORDER BY name"))
@@ -118,6 +145,19 @@ def analytics(): return render_template("analytics.html", metrics=dashboard_metr
 
 @app.route("/configuration")
 def configuration(): return render_template("configuration.html", skills=rows("SELECT * FROM skills ORDER BY name"), roles=rows("SELECT * FROM roles ORDER BY name"), role_skills={role["id"]: rows("SELECT s.name, rs.required_level FROM role_skills rs JOIN skills s ON s.id=rs.skill_id WHERE rs.role_id=?", (role["id"],)) for role in rows("SELECT id FROM roles")})
+
+def notifications_data():
+    first_employee = row("SELECT id, name FROM employees ORDER BY id LIMIT 1")
+    low_skill_count = row("SELECT COUNT(*) AS count FROM employee_skills WHERE proficiency < 35")
+    latest_resource = row("SELECT name FROM learning_resources ORDER BY id DESC LIMIT 1")
+    return [
+        {"icon": "exclamation-triangle", "title": "Training focus identified", "message": f"{low_skill_count['count']} skill baselines are below 35%.", "time": "Current analysis"},
+        {"icon": "signpost-split", "title": "Learning path ready", "message": f"A path is available for {first_employee['name']}." if first_employee else "Add an employee to generate a path.", "time": "Based on current data"},
+        {"icon": "collection-play", "title": "Resource library updated", "message": f"Latest resource: {latest_resource['name']}." if latest_resource else "No resources available.", "time": "Resource catalog"},
+    ]
+
+@app.get("/api/notifications")
+def api_notifications(): return jsonify(notifications_data())
 
 @app.post("/configuration/skills")
 def create_skill():
@@ -133,6 +173,35 @@ def create_role():
         db = connect(); cursor = db.execute("INSERT OR IGNORE INTO roles(name, description) VALUES (?, ?)", (name, request.form.get("description", "").strip())); role_id = cursor.lastrowid or row("SELECT id FROM roles WHERE name=?", (name,))["id"]
         levels = [(role_id, int(key.removeprefix("skill_")), max(0, min(100, int(value)))) for key, value in request.form.items() if key.startswith("skill_") and value.isdigit()]
         db.executemany("INSERT OR REPLACE INTO role_skills(role_id, skill_id, required_level) VALUES (?, ?, ?)", levels); db.commit(); db.close()
+    return redirect(url_for("configuration"))
+
+@app.post("/configuration/skills/<int:skill_id>/edit")
+def edit_skill(skill_id):
+    name = request.form.get("name", "").strip()
+    if name:
+        db = connect(); db.execute("UPDATE skills SET name=?, description=? WHERE id=?", (name, request.form.get("description", "").strip(), skill_id)); db.commit(); db.close()
+    return redirect(url_for("configuration"))
+
+@app.post("/configuration/skills/<int:skill_id>/delete")
+def delete_skill(skill_id):
+    db = connect()
+    employee_usage = db.execute("SELECT COUNT(*) FROM employee_skills WHERE skill_id=?", (skill_id,)).fetchone()[0]
+    role_usage = db.execute("SELECT COUNT(*) FROM role_skills WHERE skill_id=?", (skill_id,)).fetchone()[0]
+    resource_usage = db.execute("SELECT COUNT(*) FROM learning_resources WHERE skill_id=?", (skill_id,)).fetchone()[0]
+    if not employee_usage and not role_usage and not resource_usage:
+        db.execute("DELETE FROM skills WHERE id=?", (skill_id,)); db.commit()
+    db.close()
+    return redirect(url_for("configuration"))
+
+@app.post("/configuration/roles/<int:role_id>/delete")
+def delete_role(role_id):
+    db = connect(); db.execute("DELETE FROM roles WHERE id=?", (role_id,)); db.commit(); db.close(); return redirect(url_for("configuration"))
+
+@app.post("/configuration/resources")
+def create_resource():
+    payload = request.form
+    if payload.get("name") and payload.get("skill_id") and payload.get("url"):
+        db = connect(); db.execute("INSERT INTO learning_resources(name, skill_id, provider, difficulty, type, duration, description, url) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (payload["name"].strip(), int(payload["skill_id"]), payload.get("provider", "").strip(), payload.get("difficulty", "Intermediate"), payload.get("type", "Article"), payload.get("duration", "Self-paced"), payload.get("description", "").strip(), payload["url"].strip())); db.commit(); db.close()
     return redirect(url_for("configuration"))
 
 @app.post("/api/employees")
@@ -157,6 +226,7 @@ def api_recommendations(employee_id, role_id): return jsonify(recommendations(em
 @app.get("/api/learning-path/<int:employee_id>/<int:role_id>")
 def api_learning_path(employee_id, role_id): return jsonify(learning_path(employee_id, role_id))
 @app.get("/api/resources")
+@app.get("/api/resources")
 def api_resources(): return jsonify(rows("SELECT lr.*, s.name AS skill FROM learning_resources lr JOIN skills s ON s.id=lr.skill_id ORDER BY lr.name"))
 @app.post("/api/resources")
 def api_create_resource():
@@ -174,7 +244,12 @@ def api_update_skill(skill_id):
 
 @app.delete("/api/skills/<int:skill_id>")
 def api_delete_skill(skill_id):
-    db = connect(); db.execute("DELETE FROM skills WHERE id=?", (skill_id,)); db.commit(); db.close(); return jsonify({"deleted": skill_id})
+    db = connect()
+    usage = sum(db.execute(query, (skill_id,)).fetchone()[0] for query in ("SELECT COUNT(*) FROM employee_skills WHERE skill_id=?", "SELECT COUNT(*) FROM role_skills WHERE skill_id=?", "SELECT COUNT(*) FROM learning_resources WHERE skill_id=?"))
+    if usage:
+        db.close()
+        return jsonify({"error": "Skill is still referenced by employees, roles, or resources."}), 409
+    db.execute("DELETE FROM skills WHERE id=?", (skill_id,)); db.commit(); db.close(); return jsonify({"deleted": skill_id})
 
 @app.post("/api/roles")
 def api_create_role():
