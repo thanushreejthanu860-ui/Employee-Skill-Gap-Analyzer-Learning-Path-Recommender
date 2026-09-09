@@ -138,41 +138,66 @@ def index(): return redirect(url_for("dashboard")) if session.get("authenticated
 def login():
     if session.get("authenticated"):
         return redirect(url_for("dashboard"))
-    error = None
-    if request.method == "POST":
-        username = request.form.get("username", "").strip()
-        password = request.form.get("password", "")
-        if username == DEMO_USERNAME and password == DEMO_PASSWORD:
-            session.clear()
-            session["authenticated"] = True
-            session["username"] = username
-            return redirect(url_for("dashboard"))
-        error = "Invalid username or password. Use the demo credentials shown below."
-    return render_template("login.html", error=error)
-
-@app.route("/employee/login", methods=["GET", "POST"])
-def employee_login():
     if session.get("employee_authenticated"):
         return redirect(url_for("employee_dashboard"))
     error = None
     if request.method == "POST":
-        username = request.form.get("username", "").strip().lower()
+        role = request.form.get("role", "hr")
+        username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
-        employee = row("SELECT * FROM employees WHERE lower(email)=?", (username,))
-        if employee and employee.get("password_hash") and check_password_hash(employee["password_hash"], password):
+        if role == "hr":
+            if username == DEMO_USERNAME and password == DEMO_PASSWORD:
+                session.clear()
+                session["authenticated"] = True
+                session["username"] = username
+                return redirect(url_for("dashboard"))
+            error = "Invalid HR credentials."
+        else:
+            employee = row("SELECT * FROM employees WHERE lower(email)=?", (username.lower(),))
+            if employee and employee.get("password_hash") and check_password_hash(employee["password_hash"], password):
+                session.clear()
+                session["employee_authenticated"] = True
+                session["employee_id"] = employee["id"]
+                session["role"] = "Employee"
+                return redirect(url_for("employee_dashboard"))
+            error = "Invalid employee email or password."
+    return render_template("login.html", error=error)
+
+@app.route("/employee/register", methods=["GET", "POST"])
+def employee_register():
+    if session.get("employee_authenticated"):
+        return redirect(url_for("employee_dashboard"))
+    error = None
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        email = request.form.get("email", "").strip().lower()
+        department = request.form.get("department", "").strip()
+        password = request.form.get("password", "").strip()
+        if not name or not email or not department or not password:
+            error = "All fields are required."
+        elif row("SELECT id FROM employees WHERE lower(email)=?", (email,)):
+            error = "An account with that email already exists."
+        else:
+            db = connect()
+            emp_id = db.execute("INSERT INTO employees(name, email, department, experience, profile, current_role, password_hash) VALUES (?,?,?,?,?,?,?)", (name, email, department, 0, "", "", generate_password_hash(password))).lastrowid
+            db.commit()
+            db.close()
             session.clear()
             session["employee_authenticated"] = True
-            session["employee_id"] = employee["id"]
+            session["employee_id"] = emp_id
             session["role"] = "Employee"
             return redirect(url_for("employee_dashboard"))
-        error = "Invalid employee email or password."
-    return render_template("employee_login.html", error=error)
+    return render_template("employee_register.html", error=error, form=request.form)
+
+@app.route("/employee/login", methods=["GET", "POST"])
+def employee_login():
+    return redirect(url_for("login"))
 
 @app.route("/employee/dashboard")
 def employee_dashboard():
     employee = employee_from_session()
     if not employee:
-        return redirect(url_for("employee_login", next=request.path))
+        return redirect(url_for("login", next=request.path))
     employee = row("SELECT id, name, email, department, experience, current_role, profile FROM employees WHERE id=?", (employee["id"],))
     assessment = row("SELECT * FROM assessment_requests WHERE employee_id=? AND status='Pending' ORDER BY created_at DESC, id DESC LIMIT 1", (employee["id"],))
     notifications = rows("SELECT * FROM notifications WHERE recipient_role='Employee' AND recipient_id=? ORDER BY created_at DESC, id DESC LIMIT 10", (employee["id"],))
@@ -188,14 +213,19 @@ def employee_dashboard():
 def employee_messages():
     employee = employee_from_session()
     if not employee:
-        return redirect(url_for("employee_login", next=request.path))
+        return redirect(url_for("login", next=request.path))
     messages = rows("""
-        SELECT m.*, CASE WHEN m.sender_role = 'HR' THEN 'HR Manager' ELSE 'You' END AS contact_name
+        SELECT m.*,
+               CASE WHEN m.sender_id = ? THEN
+                   CASE WHEN m.receiver_role = 'HR' THEN 'HR Manager' ELSE (SELECT e.name FROM employees e WHERE e.id = m.receiver_id) END
+               ELSE
+                   CASE WHEN m.sender_role = 'HR' THEN 'HR Manager' ELSE (SELECT e.name FROM employees e WHERE e.id = m.sender_id) END
+               END AS contact_name
         FROM messages m
         WHERE (m.sender_id = ? AND m.sender_role = 'Employee')
            OR (m.receiver_id = ? AND m.receiver_role = 'Employee')
         ORDER BY m.created_at DESC, m.id DESC
-    """, (employee["id"], employee["id"]))
+    """, (employee["id"], employee["id"], employee["id"]))
     assessment = row("SELECT * FROM assessment_requests WHERE employee_id=? AND status='Pending' ORDER BY created_at DESC, id DESC LIMIT 1", (employee["id"],))
     return render_template("employee_messages.html", employee=employee, messages=messages, assessment=assessment)
 
@@ -205,19 +235,33 @@ def employee_messages():
 def employee_new_message():
     employee = employee_from_session()
     if not employee:
-        return redirect(url_for("employee_login", next=request.path))
+        return redirect(url_for("login", next=request.path))
     if request.method == "POST":
         subject = request.form.get("subject", "").strip()
         message = request.form.get("message", "").strip()
+        recipient_type = request.form.get("recipient_type", "hr")
         if not subject or not message:
             flash("Subject and message are required.", "danger")
             return render_template("employee_new_message.html", employee=employee, form=request.form)
-        db = connect()
-        db.execute("INSERT INTO messages(sender_id, receiver_id, sender_role, receiver_role, subject, message) VALUES (?, ?, 'Employee', 'HR', ?, ?)", (employee["id"], None, subject, message))
-        db.commit()
-        db.close()
-        create_notification(None, "HR", "New employee message", f"New message from {employee['name']}.")
-        flash("Message sent to HR.", "success")
+        if recipient_type == "employee":
+            recipient_email = request.form.get("recipient_email", "").strip().lower()
+            recipient = row("SELECT id, name FROM employees WHERE lower(email)=? AND id!=?", (recipient_email, employee["id"]))
+            if not recipient:
+                flash("No employee found with that email address.", "danger")
+                return render_template("employee_new_message.html", employee=employee, form=request.form)
+            db = connect()
+            db.execute("INSERT INTO messages(sender_id, receiver_id, sender_role, receiver_role, subject, message) VALUES (?, ?, 'Employee', 'Employee', ?, ?)", (employee["id"], recipient["id"], subject, message))
+            db.commit()
+            db.close()
+            create_notification(recipient["id"], "Employee", f"New message from {employee['name']}", message[:100])
+            flash(f"Message sent to {recipient['name']}.", "success")
+        else:
+            db = connect()
+            db.execute("INSERT INTO messages(sender_id, receiver_id, sender_role, receiver_role, subject, message) VALUES (?, ?, 'Employee', 'HR', ?, ?)", (employee["id"], None, subject, message))
+            db.commit()
+            db.close()
+            create_notification(None, "HR", "New employee message", f"New message from {employee['name']}.")
+            flash("Message sent to HR.", "success")
         return redirect(url_for("employee_messages"))
     return render_template("employee_new_message.html", employee=employee, form={})
 
@@ -226,12 +270,18 @@ def employee_new_message():
 def employee_message_view(message_id):
     employee = employee_from_session()
     if not employee:
-        return redirect(url_for("employee_login", next=request.path))
+        return redirect(url_for("login", next=request.path))
     message = row("""
-        SELECT m.*, CASE WHEN m.sender_role = 'HR' THEN 'HR Manager' ELSE 'You' END AS sender_name
+        SELECT m.*,
+               CASE WHEN m.sender_id = ? THEN 'You'
+                    WHEN m.sender_role = 'HR' THEN 'HR Manager'
+                    ELSE (SELECT e.name FROM employees e WHERE e.id = m.sender_id) END AS sender_name
         FROM messages m
-        WHERE m.id=? AND ((m.sender_id=? AND m.sender_role='Employee') OR (m.receiver_id=? AND m.receiver_role='Employee'))
-    """, (message_id, employee["id"], employee["id"]))
+        WHERE m.id=? AND (
+            (m.sender_id=? AND m.sender_role='Employee') OR
+            (m.receiver_id=? AND m.receiver_role='Employee')
+        )
+    """, (employee["id"], message_id, employee["id"], employee["id"]))
     if not message:
         flash("That message could not be found.", "warning")
         return redirect(url_for("employee_messages"))
@@ -310,7 +360,7 @@ def send_assessment_request(employee_id):
 def employee_assessment():
     employee = employee_from_session()
     if not employee:
-        return redirect(url_for("employee_login", next=request.path))
+        return redirect(url_for("login", next=request.path))
     assessment = row("SELECT * FROM assessment_requests WHERE employee_id=? ORDER BY created_at DESC, id DESC LIMIT 1", (employee["id"],))
     if not assessment:
         flash("No pending skill assessment found.", "info")
@@ -326,7 +376,7 @@ def employee_assessment():
 def submit_employee_assessment():
     employee = employee_from_session()
     if not employee:
-        return redirect(url_for("employee_login", next=request.path))
+        return redirect(url_for("login", next=request.path))
     assessment = row("SELECT * FROM assessment_requests WHERE id=? AND employee_id=? AND status='Pending'", (request.form.get("assessment_id"), employee["id"]))
     if not assessment:
         flash("No pending skill assessment found.", "warning")
@@ -438,6 +488,31 @@ def hr_role_matching(employee_id):
         return redirect(url_for("hr_assessments"))
     return render_template("hr_role_matching.html", employees=employees, employee=employee, matches=match_roles(employee_id))
 
+@app.route("/employee/settings", methods=["GET", "POST"])
+def employee_settings():
+    employee = employee_from_session()
+    if not employee:
+        return redirect(url_for("login", next=request.path))
+    error, success = None, None
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "").strip()
+        if not email:
+            error = "Email is required."
+        else:
+            existing = row("SELECT id FROM employees WHERE lower(email)=? AND id!=?", (email, employee["id"]))
+            if existing:
+                error = "That email is already in use by another employee."
+            else:
+                db = connect()
+                db.execute("UPDATE employees SET email=? WHERE id=?", (email, employee["id"]))
+                if password:
+                    db.execute("UPDATE employees SET password_hash=? WHERE id=?", (generate_password_hash(password), employee["id"]))
+                db.commit()
+                db.close()
+                success = "Your email and password have been updated. Use your new email to log in next time."
+    employee = row("SELECT id, name, email FROM employees WHERE id=?", (employee["id"],))
+    return render_template("employee_settings.html", employee=employee, error=error, success=success)
 @app.get("/logout")
 def logout():
     session.clear()
@@ -553,7 +628,7 @@ def hr_learning_path(employee_id):
 def employee_learning_path():
     employee = employee_from_session()
     if not employee:
-        return redirect(url_for("employee_login", next=request.path))
+        return redirect(url_for("login", next=request.path))
     completed = row("SELECT id FROM assessment_requests WHERE employee_id=? AND status IN ('Completed', 'Reviewed') ORDER BY id DESC LIMIT 1", (employee["id"],))
     profile = row("SELECT target_role_id FROM employee_profiles WHERE employee_id=?", (employee["id"],))
     roles = rows("SELECT * FROM roles ORDER BY name")

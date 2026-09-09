@@ -15,7 +15,7 @@ def assessed_employees():
         WHERE ar.status IN ('Completed', 'Reviewed')
           AND ar.id=(SELECT latest.id FROM assessment_requests latest WHERE latest.employee_id=e.id ORDER BY latest.id DESC LIMIT 1)
         ORDER BY e.name
-    "")
+    """)
 
 
 def organization_analytics():
