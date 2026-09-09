@@ -1,6 +1,7 @@
 import json
 import sqlite3
 from pathlib import Path
+from werkzeug.security import generate_password_hash
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "database" / "skillpath.db"
@@ -56,19 +57,105 @@ def connect():
 def init_db():
     db = connect()
     db.executescript("""
-    CREATE TABLE IF NOT EXISTS employees (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE, department TEXT NOT NULL, experience INTEGER NOT NULL DEFAULT 1, profile TEXT DEFAULT '', current_role TEXT DEFAULT '', created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+    CREATE TABLE IF NOT EXISTS employees (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE, department TEXT NOT NULL, experience INTEGER NOT NULL DEFAULT 1, profile TEXT DEFAULT '', current_role TEXT DEFAULT '', password_hash TEXT DEFAULT '', created_at TEXT DEFAULT CURRENT_TIMESTAMP);
     CREATE TABLE IF NOT EXISTS skills (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, description TEXT DEFAULT '');
     CREATE TABLE IF NOT EXISTS employee_skills (employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE, skill_id INTEGER NOT NULL REFERENCES skills(id) ON DELETE CASCADE, proficiency INTEGER NOT NULL CHECK(proficiency BETWEEN 0 AND 100), PRIMARY KEY(employee_id, skill_id));
     CREATE TABLE IF NOT EXISTS roles (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, description TEXT DEFAULT '');
     CREATE TABLE IF NOT EXISTS role_skills (role_id INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE, skill_id INTEGER NOT NULL REFERENCES skills(id) ON DELETE CASCADE, required_level INTEGER NOT NULL CHECK(required_level BETWEEN 0 AND 100), PRIMARY KEY(role_id, skill_id));
     CREATE TABLE IF NOT EXISTS learning_resources (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, skill_id INTEGER NOT NULL REFERENCES skills(id) ON DELETE CASCADE, provider TEXT DEFAULT '', difficulty TEXT NOT NULL, type TEXT NOT NULL, duration TEXT NOT NULL, description TEXT DEFAULT '', url TEXT DEFAULT '#');
+    CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sender_id INTEGER REFERENCES employees(id) ON DELETE CASCADE,
+        receiver_id INTEGER,
+        sender_role TEXT NOT NULL CHECK(sender_role IN ('Employee', 'HR')),
+        receiver_role TEXT NOT NULL CHECK(receiver_role IN ('Employee', 'HR')),
+        subject TEXT NOT NULL,
+        message TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        is_read INTEGER NOT NULL DEFAULT 0 CHECK(is_read IN (0, 1))
+    );
+    CREATE TABLE IF NOT EXISTS assessment_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+        hr_id INTEGER,
+        status TEXT NOT NULL DEFAULT 'Pending' CHECK(status IN ('Pending', 'Completed', 'Reviewed')),
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        completed_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS employee_profiles (
+        employee_id INTEGER PRIMARY KEY REFERENCES employees(id) ON DELETE CASCADE,
+        target_role_id INTEGER REFERENCES roles(id) ON DELETE SET NULL,
+        highest_qualification TEXT DEFAULT '',
+        specialization TEXT DEFAULT '',
+        resume_summary TEXT DEFAULT '',
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS employee_certifications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        issuer TEXT DEFAULT '',
+        issued_at TEXT DEFAULT ''
+    );
+    CREATE TABLE IF NOT EXISTS employee_projects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        description TEXT DEFAULT '',
+        technologies TEXT DEFAULT ''
+    );
+    CREATE TABLE IF NOT EXISTS notifications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        recipient_id INTEGER,
+        recipient_role TEXT NOT NULL CHECK(recipient_role IN ('Employee', 'HR')),
+        title TEXT NOT NULL,
+        message TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        is_read INTEGER NOT NULL DEFAULT 0 CHECK(is_read IN (0, 1))
+    );
+    CREATE INDEX IF NOT EXISTS idx_messages_receiver ON messages(receiver_id, receiver_role, is_read);
+    CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id, sender_role);
+    CREATE INDEX IF NOT EXISTS idx_assessment_requests_employee ON assessment_requests(employee_id, status);
+    CREATE INDEX IF NOT EXISTS idx_notifications_recipient ON notifications(recipient_id, recipient_role, is_read);
     """)
+    message_columns = {item[1]: item for item in db.execute("PRAGMA table_info(messages)").fetchall()}
+    if message_columns.get("sender_id", (None, None, None, 0))[3] == 1:
+        db.execute("DROP INDEX IF EXISTS idx_messages_receiver")
+        db.execute("DROP INDEX IF EXISTS idx_messages_sender")
+        db.execute("ALTER TABLE messages RENAME TO messages_legacy")
+        db.execute("""
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender_id INTEGER REFERENCES employees(id) ON DELETE CASCADE,
+            receiver_id INTEGER,
+            sender_role TEXT NOT NULL CHECK(sender_role IN ('Employee', 'HR')),
+            receiver_role TEXT NOT NULL CHECK(receiver_role IN ('Employee', 'HR')),
+            subject TEXT NOT NULL,
+            message TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            is_read INTEGER NOT NULL DEFAULT 0 CHECK(is_read IN (0, 1))
+        )
+        """)
+        db.execute("INSERT INTO messages(id, sender_id, receiver_id, sender_role, receiver_role, subject, message, created_at, is_read) SELECT id, sender_id, receiver_id, sender_role, receiver_role, subject, message, created_at, is_read FROM messages_legacy")
+        db.execute("DROP TABLE messages_legacy")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_messages_receiver ON messages(receiver_id, receiver_role, is_read)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id, sender_role)")
     employee_columns = {item[1] for item in db.execute("PRAGMA table_info(employees)").fetchall()}
     resource_columns = {item[1] for item in db.execute("PRAGMA table_info(learning_resources)").fetchall()}
     if "current_role" not in employee_columns:
         db.execute("ALTER TABLE employees ADD COLUMN current_role TEXT DEFAULT ''")
+    if "password_hash" not in employee_columns:
+        db.execute("ALTER TABLE employees ADD COLUMN password_hash TEXT DEFAULT ''")
     if "provider" not in resource_columns:
         db.execute("ALTER TABLE learning_resources ADD COLUMN provider TEXT DEFAULT ''")
+    employee_skill_columns = {item[1] for item in db.execute("PRAGMA table_info(employee_skills)").fetchall()}
+    if "experience" not in employee_skill_columns:
+        db.execute("ALTER TABLE employee_skills ADD COLUMN experience TEXT DEFAULT ''")
+    profile_columns = {item[1] for item in db.execute("PRAGMA table_info(employee_profiles)").fetchall()}
+    if "institution" not in profile_columns:
+        db.execute("ALTER TABLE employee_profiles ADD COLUMN institution TEXT DEFAULT ''")
+    if "resume_filename" not in profile_columns:
+        db.execute("ALTER TABLE employee_profiles ADD COLUMN resume_filename TEXT DEFAULT ''")
     if db.execute("SELECT COUNT(*) FROM skills").fetchone()[0] == 0:
         db.executemany("INSERT INTO skills(name, description) VALUES (?, ?)", SKILLS)
         for role_name, description in [(name, f"Synthetic requirements for the {name} pathway.") for name in ROLES]:
@@ -93,6 +180,7 @@ def init_db():
     db.execute("UPDATE learning_resources SET url = CASE (SELECT name FROM skills WHERE id=learning_resources.skill_id) WHEN 'Python' THEN 'https://www.python.org/about/gettingstarted/' WHEN 'SQL' THEN 'https://www.w3schools.com/sql/' WHEN 'Pandas' THEN 'https://pandas.pydata.org/docs/getting_started/intro_tutorials/' WHEN 'Statistics' THEN 'https://www.khanacademy.org/math/statistics-probability' WHEN 'Machine Learning' THEN 'https://developers.google.com/machine-learning/crash-course' WHEN 'Power BI' THEN 'https://learn.microsoft.com/en-us/training/powerplatform/power-bi' WHEN 'Excel' THEN 'https://support.microsoft.com/en-us/excel' WHEN 'Data Visualization' THEN 'https://matplotlib.org/stable/tutorials/pyplot.html' WHEN 'Communication' THEN 'https://www.atlassian.com/team-playbook' WHEN 'Problem Solving' THEN 'https://www.mckinsey.com/capabilities/people-and-organizational-performance/our-insights' ELSE 'https://www.khanacademy.org/' END WHERE url IS NULL OR url = '#'")
     db.execute("UPDATE learning_resources SET type = CASE WHEN type IN ('Workshop', 'Lab') THEN 'Video' WHEN type = 'Project' THEN 'Course' ELSE type END WHERE type NOT IN ('Video', 'Course', 'Article')")
     db.execute("UPDATE employees SET current_role = CASE (id % 4) WHEN 1 THEN 'Data Analyst' WHEN 2 THEN 'Python Developer' WHEN 3 THEN 'Business Analyst' ELSE 'Data Scientist' END WHERE current_role IS NULL OR current_role = ''")
+    db.execute("UPDATE employees SET password_hash = ? WHERE password_hash IS NULL OR password_hash = ''", (generate_password_hash("employee123"),))
     db.commit()
     db.close()
 

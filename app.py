@@ -1,12 +1,20 @@
+from io import StringIO
 from pathlib import Path
-from flask import Flask, jsonify, redirect, render_template, request, session, url_for
+import csv
+from flask import Flask, flash, jsonify, make_response, redirect, render_template, request, send_from_directory, session, url_for
+from werkzeug.utils import secure_filename
+from werkzeug.security import check_password_hash, generate_password_hash
 from database import connect, init_db, row, rows
 from services.analysis import analyze, dashboard_metrics, employee_skills, extract_skills, learning_path, match_roles, recommendations
+from services.analytics import organization_analytics
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "skillpath-demo-secret"
+app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
+app.config["RESUME_UPLOAD_FOLDER"] = Path(__file__).resolve().parent / "uploads" / "resumes"
 DEMO_USERNAME = "admin"
 DEMO_PASSWORD = "admin123"
+EMPLOYEE_DEFAULT_PASSWORD = "employee123"
 init_db()
 
 
@@ -22,7 +30,7 @@ def save_employee(payload, employee_id=None):
         db.execute("UPDATE employees SET name=?, email=?, department=?, experience=?, profile=? WHERE id=?", values + (employee_id,))
         db.execute("DELETE FROM employee_skills WHERE employee_id=?", (employee_id,))
     else:
-        employee_id = db.execute("INSERT INTO employees(name,email,department,experience,profile) VALUES (?,?,?,?,?)", values).lastrowid
+        employee_id = db.execute("INSERT INTO employees(name,email,department,experience,profile,password_hash) VALUES (?,?,?,?,?,?)", values + (generate_password_hash(EMPLOYEE_DEFAULT_PASSWORD),)).lastrowid
     skill_map = {item["name"]: item["id"] for item in rows("SELECT id, name FROM skills")}
     skills = payload.get("skills", {})
     for skill_name in extract_skills(values[-1]):
@@ -35,6 +43,92 @@ def save_employee(payload, employee_id=None):
 @app.context_processor
 def inject_globals():
     return {"nav_employee_count": row("SELECT COUNT(*) AS count FROM employees")["count"], "notifications": notifications_data()}
+
+
+def create_notification(recipient_id, recipient_role, title, message):
+    db = connect()
+    db.execute("INSERT INTO notifications(recipient_id, recipient_role, title, message) VALUES (?, ?, ?, ?)", (recipient_id, recipient_role, title, message))
+    db.commit()
+    db.close()
+
+
+def assessment_form_data(employee_id):
+    profile = row("SELECT * FROM employee_profiles WHERE employee_id=?", (employee_id,)) or {}
+    certifications = rows("SELECT * FROM employee_certifications WHERE employee_id=? ORDER BY id", (employee_id,))
+    projects = rows("SELECT * FROM employee_projects WHERE employee_id=? ORDER BY id", (employee_id,))
+    return profile, certifications, projects
+
+
+def save_assessment(employee_id, form, files):
+    employee = row("SELECT * FROM employees WHERE id=?", (employee_id,))
+    if not employee:
+        raise ValueError("Employee account could not be found.")
+    if form.get("employee_id", "").strip() != str(employee_id):
+        raise ValueError("The employee ID does not match the signed-in account.")
+    required = {field: form.get(field, "").strip() for field in ("name", "department", "current_role", "target_role_id")}
+    if any(not value for value in required.values()):
+        raise ValueError("Please complete all required professional information.")
+    try:
+        experience = float(form.get("experience", ""))
+        if experience < 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ValueError("Years of experience must be a non-negative number.")
+    target_role = row("SELECT id FROM roles WHERE id=?", (required["target_role_id"],))
+    if not target_role:
+        raise ValueError("Please select a valid target role.")
+    skill_ids = form.getlist("skill_id")
+    levels = form.getlist("skill_level")
+    descriptions = form.getlist("skill_description")
+    if not skill_ids:
+        raise ValueError("Add at least one current skill.")
+    skill_rows = rows("SELECT id FROM skills WHERE id IN ({})".format(",".join("?" for _ in skill_ids)), skill_ids)
+    valid_skill_ids = {str(item["id"]) for item in skill_rows}
+    if any(skill_id not in valid_skill_ids for skill_id in skill_ids) or len(skill_ids) != len(levels):
+        raise ValueError("Please select valid skills and proficiency levels.")
+    skill_values = []
+    for index, skill_id in enumerate(skill_ids):
+        try:
+            level = int(levels[index])
+            if level < 0 or level > 100:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise ValueError("Skill proficiency must be between 0 and 100.")
+        skill_values.append((employee_id, int(skill_id), level, descriptions[index].strip() if index < len(descriptions) else ""))
+    resume = files.get("resume")
+    resume_filename = ""
+    if resume and resume.filename:
+        resume_filename = secure_filename(resume.filename)
+        if not resume_filename or "." not in resume_filename or resume_filename.rsplit(".", 1)[1].lower() not in {"pdf", "doc", "docx"}:
+            raise ValueError("Resume must be a PDF, DOC, or DOCX file.")
+        app.config["RESUME_UPLOAD_FOLDER"].mkdir(parents=True, exist_ok=True)
+        resume.save(app.config["RESUME_UPLOAD_FOLDER"] / f"{employee_id}_{resume_filename}")
+    db = connect()
+    try:
+        db.execute("UPDATE employees SET name=?, department=?, current_role=?, experience=?, profile=? WHERE id=?", (required["name"], required["department"], required["current_role"], experience, form.get("resume_summary", "").strip(), employee_id))
+        db.execute("INSERT INTO employee_profiles(employee_id, target_role_id, highest_qualification, specialization, institution, resume_summary, resume_filename, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(employee_id) DO UPDATE SET target_role_id=excluded.target_role_id, highest_qualification=excluded.highest_qualification, specialization=excluded.specialization, institution=excluded.institution, resume_summary=excluded.resume_summary, resume_filename=CASE WHEN excluded.resume_filename='' THEN employee_profiles.resume_filename ELSE excluded.resume_filename END, updated_at=CURRENT_TIMESTAMP", (employee_id, int(required["target_role_id"]), form.get("qualification", "").strip(), form.get("specialization", "").strip(), form.get("institution", "").strip(), form.get("resume_summary", "").strip(), resume_filename))
+        db.execute("DELETE FROM employee_skills WHERE employee_id=?", (employee_id,))
+        db.executemany("INSERT INTO employee_skills(employee_id, skill_id, proficiency, experience) VALUES (?, ?, ?, ?)", skill_values)
+        db.execute("DELETE FROM employee_certifications WHERE employee_id=?", (employee_id,))
+        db.executemany("INSERT INTO employee_certifications(employee_id, name, issuer, issued_at) VALUES (?, ?, ?, ?)", [(employee_id, name.strip(), issuer.strip(), year.strip()) for name, issuer, year in zip(form.getlist("cert_name"), form.getlist("cert_issuer"), form.getlist("cert_year")) if name.strip()])
+        db.execute("DELETE FROM employee_projects WHERE employee_id=?", (employee_id,))
+        db.executemany("INSERT INTO employee_projects(employee_id, name, description, technologies) VALUES (?, ?, ?, ?)", [(employee_id, name.strip(), description.strip(), technologies.strip()) for name, description, technologies in zip(form.getlist("project_name"), form.getlist("project_description"), form.getlist("project_technologies")) if name.strip()])
+        assessment_update = db.execute("UPDATE assessment_requests SET status='Completed', completed_at=CURRENT_TIMESTAMP WHERE id=? AND employee_id=? AND status='Pending'", (form.get("assessment_id"), employee_id))
+        if assessment_update.rowcount != 1:
+            raise ValueError("This assessment request is no longer pending.")
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+    create_notification(employee_id, "HR", "Assessment Submitted", f"{required['name']} has submitted the Skill Assessment.")
+
+
+def employee_from_session():
+    if not session.get("employee_authenticated") or not session.get("employee_id"):
+        return None
+    return row("SELECT id, name, email FROM employees WHERE id=?", (session["employee_id"],))
 
 
 @app.route("/")
@@ -56,6 +150,294 @@ def login():
         error = "Invalid username or password. Use the demo credentials shown below."
     return render_template("login.html", error=error)
 
+@app.route("/employee/login", methods=["GET", "POST"])
+def employee_login():
+    if session.get("employee_authenticated"):
+        return redirect(url_for("employee_dashboard"))
+    error = None
+    if request.method == "POST":
+        username = request.form.get("username", "").strip().lower()
+        password = request.form.get("password", "")
+        employee = row("SELECT * FROM employees WHERE lower(email)=?", (username,))
+        if employee and employee.get("password_hash") and check_password_hash(employee["password_hash"], password):
+            session.clear()
+            session["employee_authenticated"] = True
+            session["employee_id"] = employee["id"]
+            session["role"] = "Employee"
+            return redirect(url_for("employee_dashboard"))
+        error = "Invalid employee email or password."
+    return render_template("employee_login.html", error=error)
+
+@app.route("/employee/dashboard")
+def employee_dashboard():
+    employee = employee_from_session()
+    if not employee:
+        return redirect(url_for("employee_login", next=request.path))
+    employee = row("SELECT id, name, email, department, experience, current_role, profile FROM employees WHERE id=?", (employee["id"],))
+    assessment = row("SELECT * FROM assessment_requests WHERE employee_id=? AND status='Pending' ORDER BY created_at DESC, id DESC LIMIT 1", (employee["id"],))
+    notifications = rows("SELECT * FROM notifications WHERE recipient_role='Employee' AND recipient_id=? ORDER BY created_at DESC, id DESC LIMIT 10", (employee["id"],))
+    completed = row("SELECT id FROM assessment_requests WHERE employee_id=? AND status IN ('Completed','Reviewed') ORDER BY id DESC LIMIT 1", (employee["id"],))
+    profile = row("SELECT target_role_id FROM employee_profiles WHERE employee_id=?", (employee["id"],))
+    target_role = row("SELECT * FROM roles WHERE id=?", (profile["target_role_id"],)) if profile and profile["target_role_id"] else None
+    result = analyze(employee["id"], target_role["id"]) if completed and target_role else None
+    employee_path = learning_path(employee["id"], target_role["id"]) if result else []
+    return render_template("employee_dashboard.html", employee=employee, skills=employee_skills(employee["id"]), assessment=assessment, employee_notifications=notifications, target_role=target_role, employee_result=result, employee_path=employee_path)
+
+
+@app.get("/employee/messages")
+def employee_messages():
+    employee = employee_from_session()
+    if not employee:
+        return redirect(url_for("employee_login", next=request.path))
+    messages = rows("""
+        SELECT m.*, CASE WHEN m.sender_role = 'HR' THEN 'HR Manager' ELSE 'You' END AS contact_name
+        FROM messages m
+        WHERE (m.sender_id = ? AND m.sender_role = 'Employee')
+           OR (m.receiver_id = ? AND m.receiver_role = 'Employee')
+        ORDER BY m.created_at DESC, m.id DESC
+    """, (employee["id"], employee["id"]))
+    assessment = row("SELECT * FROM assessment_requests WHERE employee_id=? AND status='Pending' ORDER BY created_at DESC, id DESC LIMIT 1", (employee["id"],))
+    return render_template("employee_messages.html", employee=employee, messages=messages, assessment=assessment)
+
+
+@app.route("/employee/messages/new", methods=["GET", "POST"])
+@app.post("/employee/messages/send")
+def employee_new_message():
+    employee = employee_from_session()
+    if not employee:
+        return redirect(url_for("employee_login", next=request.path))
+    if request.method == "POST":
+        subject = request.form.get("subject", "").strip()
+        message = request.form.get("message", "").strip()
+        if not subject or not message:
+            flash("Subject and message are required.", "danger")
+            return render_template("employee_new_message.html", employee=employee, form=request.form)
+        db = connect()
+        db.execute("INSERT INTO messages(sender_id, receiver_id, sender_role, receiver_role, subject, message) VALUES (?, ?, 'Employee', 'HR', ?, ?)", (employee["id"], None, subject, message))
+        db.commit()
+        db.close()
+        create_notification(None, "HR", "New employee message", f"New message from {employee['name']}.")
+        flash("Message sent to HR.", "success")
+        return redirect(url_for("employee_messages"))
+    return render_template("employee_new_message.html", employee=employee, form={})
+
+
+@app.get("/employee/messages/<int:message_id>")
+def employee_message_view(message_id):
+    employee = employee_from_session()
+    if not employee:
+        return redirect(url_for("employee_login", next=request.path))
+    message = row("""
+        SELECT m.*, CASE WHEN m.sender_role = 'HR' THEN 'HR Manager' ELSE 'You' END AS sender_name
+        FROM messages m
+        WHERE m.id=? AND ((m.sender_id=? AND m.sender_role='Employee') OR (m.receiver_id=? AND m.receiver_role='Employee'))
+    """, (message_id, employee["id"], employee["id"]))
+    if not message:
+        flash("That message could not be found.", "warning")
+        return redirect(url_for("employee_messages"))
+    if message["receiver_role"] == "Employee" and message["receiver_id"] == employee["id"] and not message["is_read"]:
+        db = connect(); db.execute("UPDATE messages SET is_read=1 WHERE id=?", (message_id,)); db.commit(); db.close()
+        message["is_read"] = 1
+    return render_template("employee_message_view.html", employee=employee, message=message)
+
+
+@app.get("/hr/messages")
+def hr_messages():
+    if not session.get("authenticated"):
+        return redirect(url_for("login", next=request.path))
+    messages = rows("""
+        SELECT m.*, e.name AS employee_name, (SELECT ar.status FROM assessment_requests ar WHERE ar.employee_id=e.id ORDER BY ar.id DESC LIMIT 1) AS assessment_status
+        FROM messages m JOIN employees e ON e.id=m.sender_id
+        WHERE m.sender_role='Employee' AND m.receiver_role='HR'
+        ORDER BY m.created_at DESC, m.id DESC
+    """)
+    return render_template("hr_messages.html", messages=messages)
+
+
+@app.route("/hr/messages/<int:message_id>", methods=["GET", "POST"])
+def hr_message_view(message_id):
+    if not session.get("authenticated"):
+        return redirect(url_for("login", next=request.path))
+    message = row("""
+        SELECT m.*, e.name AS employee_name, e.email AS employee_email
+        FROM messages m JOIN employees e ON e.id=m.sender_id
+        WHERE m.id=? AND m.sender_role='Employee' AND m.receiver_role='HR'
+    """, (message_id,))
+    if not message:
+        flash("That message could not be found.", "warning")
+        return redirect(url_for("hr_messages"))
+    if not message["is_read"]:
+        db = connect(); db.execute("UPDATE messages SET is_read=1 WHERE id=?", (message_id,)); db.commit(); db.close()
+        message["is_read"] = 1
+    if request.method == "POST":
+        reply = request.form.get("message", "").strip()
+        if not reply:
+            flash("Reply message cannot be empty.", "danger")
+        else:
+            subject = message["subject"] if message["subject"].lower().startswith("re:") else f"Re: {message['subject']}"
+            db = connect()
+            db.execute("INSERT INTO messages(sender_id, receiver_id, sender_role, receiver_role, subject, message) VALUES (?, ?, 'HR', 'Employee', ?, ?)", (None, message["sender_id"], subject, reply))
+            db.commit(); db.close()
+            create_notification(message["sender_id"], "Employee", "HR replied to your message", "HR replied to your message.")
+            flash("Reply sent to the employee.", "success")
+            return redirect(url_for("hr_message_view", message_id=message_id))
+    assessment = row("SELECT * FROM assessment_requests WHERE employee_id=? ORDER BY created_at DESC, id DESC LIMIT 1", (message["sender_id"],))
+    return render_template("hr_message_view.html", message=message, assessment=assessment)
+
+
+@app.post("/hr/assessment/send/<int:employee_id>")
+def send_assessment_request(employee_id):
+    if not session.get("authenticated"):
+        return redirect(url_for("login", next=request.path))
+    employee = row("SELECT id, name FROM employees WHERE id=?", (employee_id,))
+    if not employee:
+        flash("That employee could not be found.", "warning")
+        return redirect(url_for("hr_messages"))
+    pending = row("SELECT id FROM assessment_requests WHERE employee_id=? AND status='Pending' LIMIT 1", (employee_id,))
+    if pending:
+        flash("This employee already has a pending assessment request.", "warning")
+        return redirect(url_for("hr_messages"))
+    db = connect()
+    db.execute("INSERT INTO assessment_requests(employee_id, hr_id, status) VALUES (?, ?, 'Pending')", (employee_id, None))
+    db.commit()
+    db.close()
+    create_notification(employee_id, "Employee", "Skill Assessment Requested", "HR Manager has requested you to complete your Skill Assessment Form.")
+    flash("Skill Assessment Form sent successfully.", "success")
+    return redirect(url_for("hr_messages"))
+
+
+@app.get("/employee/assessment")
+def employee_assessment():
+    employee = employee_from_session()
+    if not employee:
+        return redirect(url_for("employee_login", next=request.path))
+    assessment = row("SELECT * FROM assessment_requests WHERE employee_id=? ORDER BY created_at DESC, id DESC LIMIT 1", (employee["id"],))
+    if not assessment:
+        flash("No pending skill assessment found.", "info")
+        return redirect(url_for("employee_dashboard"))
+    profile, certifications, projects = assessment_form_data(employee["id"])
+    target_role = row("SELECT name FROM roles WHERE id=?", (profile.get("target_role_id"),)) if profile.get("target_role_id") else None
+    if assessment["status"] == "Completed":
+        return render_template("employee_assessment_submitted.html", employee=employee, assessment=assessment, profile=profile, target_role=target_role, certifications=certifications, projects=projects, skills=employee_skills(employee["id"]))
+    return render_template("employee_assessment.html", employee=employee, assessment=assessment, profile=profile, certifications=certifications, projects=projects, skills=rows("SELECT * FROM skills ORDER BY name"), roles=rows("SELECT * FROM roles ORDER BY name"), current_skills=employee_skills(employee["id"]))
+
+
+@app.post("/employee/assessment")
+def submit_employee_assessment():
+    employee = employee_from_session()
+    if not employee:
+        return redirect(url_for("employee_login", next=request.path))
+    assessment = row("SELECT * FROM assessment_requests WHERE id=? AND employee_id=? AND status='Pending'", (request.form.get("assessment_id"), employee["id"]))
+    if not assessment:
+        flash("No pending skill assessment found.", "warning")
+        return redirect(url_for("employee_dashboard"))
+    try:
+        save_assessment(employee["id"], request.form, request.files)
+    except ValueError as error:
+        profile, certifications, projects = assessment_form_data(employee["id"])
+        flash(str(error), "danger")
+        return render_template("employee_assessment.html", employee=employee, assessment=assessment, profile=profile, certifications=certifications, projects=projects, skills=rows("SELECT * FROM skills ORDER BY name"), roles=rows("SELECT * FROM roles ORDER BY name"), current_skills=employee_skills(employee["id"])), 400
+    flash("Assessment submitted successfully.", "success")
+    return redirect(url_for("employee_assessment"))
+
+
+@app.get("/hr/assessment/<int:employee_id>")
+@app.get("/hr/assessments/<int:employee_id>")
+def hr_assessment_review(employee_id):
+    if not session.get("authenticated"):
+        return redirect(url_for("login", next=request.path))
+    employee = row("SELECT id, name, email, department, experience, current_role, profile FROM employees WHERE id=?", (employee_id,))
+    assessment = row("SELECT * FROM assessment_requests WHERE employee_id=? AND status IN ('Completed', 'Reviewed') ORDER BY completed_at DESC, id DESC LIMIT 1", (employee_id,))
+    if not employee or not assessment:
+        flash("The submitted assessment could not be found.", "warning")
+        return redirect(url_for("hr_assessments"))
+    profile, certifications, projects = assessment_form_data(employee_id)
+    target_role = row("SELECT name FROM roles WHERE id=?", (profile.get("target_role_id"),)) if profile.get("target_role_id") else None
+    return render_template("hr_assessment_review.html", employee=employee, assessment=assessment, profile=profile, target_role=target_role, certifications=certifications, projects=projects, skills=employee_skills(employee_id))
+
+
+@app.get("/hr/assessments")
+def hr_assessments():
+    if not session.get("authenticated"):
+        return redirect(url_for("login", next=request.path))
+    assessments = rows("""
+        SELECT ar.*, e.name, e.department, e.current_role, e.experience,
+               r.name AS target_role
+        FROM assessment_requests ar
+        JOIN employees e ON e.id=ar.employee_id
+        LEFT JOIN employee_profiles ep ON ep.employee_id=e.id
+        LEFT JOIN roles r ON r.id=ep.target_role_id
+        WHERE ar.id = (SELECT latest.id FROM assessment_requests latest WHERE latest.employee_id=ar.employee_id ORDER BY latest.id DESC LIMIT 1)
+        ORDER BY CASE ar.status WHEN 'Completed' THEN 1 WHEN 'Pending' THEN 2 ELSE 3 END, COALESCE(ar.completed_at, ar.created_at) DESC
+    """)
+    return render_template("hr_assessments.html", assessments=assessments)
+
+
+@app.post("/hr/assessments/<int:employee_id>/review")
+def mark_assessment_reviewed(employee_id):
+    if not session.get("authenticated"):
+        return redirect(url_for("login", next=request.path))
+    db = connect()
+    updated = db.execute("UPDATE assessment_requests SET status='Reviewed' WHERE employee_id=? AND status='Completed'", (employee_id,))
+    db.commit()
+    db.close()
+    if updated.rowcount:
+        flash("Assessment marked as reviewed.", "success")
+    else:
+        flash("No completed assessment is available to review.", "warning")
+    return redirect(url_for("hr_assessment_review", employee_id=employee_id))
+
+
+@app.get("/hr/assessments/<int:employee_id>/resume")
+def hr_assessment_resume(employee_id):
+    if not session.get("authenticated"):
+        return redirect(url_for("login", next=request.path))
+    profile = row("SELECT resume_filename FROM employee_profiles WHERE employee_id=?", (employee_id,))
+    assessment = row("SELECT id FROM assessment_requests WHERE employee_id=? AND status IN ('Completed', 'Reviewed')", (employee_id,))
+    if not profile or not profile["resume_filename"] or not assessment:
+        flash("No submitted resume is available.", "warning")
+        return redirect(url_for("hr_assessment_review", employee_id=employee_id))
+    return send_from_directory(app.config["RESUME_UPLOAD_FOLDER"], f"{employee_id}_{profile['resume_filename']}", as_attachment=False, download_name=profile["resume_filename"])
+
+
+@app.get("/hr/skill-analysis", defaults={"employee_id": None})
+@app.get("/hr/skill-analysis/<int:employee_id>")
+def hr_skill_analysis(employee_id):
+    if not session.get("authenticated"):
+        return redirect(url_for("login", next=request.path))
+    employees = rows("SELECT DISTINCT e.* FROM employees e JOIN assessment_requests ar ON ar.employee_id=e.id WHERE ar.status IN ('Completed', 'Reviewed') ORDER BY e.name")
+    roles = rows("SELECT * FROM roles ORDER BY name")
+    if not employees or not roles:
+        flash("A completed employee assessment and at least one role are required.", "info")
+        return render_template("hr_skill_analysis.html", employees=employees, roles=roles, employee=None, selected_role=None, result=None)
+    requested_employee_id = request.args.get("employee_id")
+    employee_id = int(requested_employee_id) if requested_employee_id else int(employee_id or row("SELECT e.id FROM employees e JOIN assessment_requests ar ON ar.employee_id=e.id WHERE ar.status IN ('Completed', 'Reviewed') ORDER BY e.name LIMIT 1")["id"])
+    employee = row("SELECT * FROM employees WHERE id=?", (employee_id,))
+    if not employee or employee["id"] not in {item["id"] for item in employees}:
+        flash("That employee assessment could not be found.", "warning")
+        return redirect(url_for("hr_skill_analysis"))
+    profile = row("SELECT target_role_id FROM employee_profiles WHERE employee_id=?", (employee_id,))
+    role_id = int(request.args.get("role_id", profile["target_role_id"] if profile and profile["target_role_id"] else roles[0]["id"]))
+    selected_role = row("SELECT * FROM roles WHERE id=?", (role_id,))
+    if not selected_role:
+        flash("That target role could not be found.", "warning")
+        return redirect(url_for("hr_skill_analysis", employee_id=employee_id))
+    result = analyze(employee_id, role_id)
+    match = next((item for item in match_roles(employee_id) if item["id"] == role_id), None)
+    return render_template("hr_skill_analysis.html", employees=employees, roles=roles, employee=employee, selected_role=selected_role, result=result, match=match)
+
+
+@app.get("/hr/role-matching/<int:employee_id>")
+def hr_role_matching(employee_id):
+    if not session.get("authenticated"):
+        return redirect(url_for("login", next=request.path))
+    employees = rows("SELECT DISTINCT e.* FROM employees e JOIN assessment_requests ar ON ar.employee_id=e.id WHERE ar.status IN ('Completed', 'Reviewed') ORDER BY e.name")
+    employee = row("SELECT * FROM employees WHERE id=?", (employee_id,))
+    if not employee or employee["id"] not in {item["id"] for item in employees}:
+        flash("That employee assessment could not be found.", "warning")
+        return redirect(url_for("hr_assessments"))
+    return render_template("hr_role_matching.html", employees=employees, employee=employee, matches=match_roles(employee_id))
+
 @app.get("/logout")
 def logout():
     session.clear()
@@ -65,7 +447,9 @@ def logout():
 def dashboard():
     if not session.get("authenticated"):
         return redirect(url_for("login", next=request.path))
-    return render_template("dashboard.html", metrics=dashboard_metrics(), people=rows("SELECT * FROM employees ORDER BY name LIMIT 5"))
+    assessment_summary = row("SELECT COUNT(*) AS total, SUM(CASE WHEN status='Pending' THEN 1 ELSE 0 END) AS pending, SUM(CASE WHEN status IN ('Completed', 'Reviewed') THEN 1 ELSE 0 END) AS completed FROM assessment_requests")
+    recent_assessments = rows("SELECT ar.employee_id, ar.status, ar.completed_at, e.name, e.current_role FROM assessment_requests ar JOIN employees e ON e.id=ar.employee_id WHERE ar.status IN ('Completed','Reviewed') ORDER BY ar.completed_at DESC, ar.id DESC LIMIT 5")
+    return render_template("dashboard.html", metrics=dashboard_metrics(), people=rows("SELECT * FROM employees ORDER BY name LIMIT 5"), assessment_summary=assessment_summary, recent_assessments=recent_assessments)
 
 @app.route("/employees")
 def employees():
@@ -129,6 +513,14 @@ def matching_page(employee_id):
 @app.route("/learning-path", defaults={"employee_id": None})
 @app.route("/learning-path/<int:employee_id>")
 def learning_path_page(employee_id):
+    if session.get("employee_authenticated"):
+        own_employee_id = session.get("employee_id")
+        if employee_id and employee_id != own_employee_id:
+            flash("You can only view your own learning path.", "warning")
+            return redirect(url_for("employee_learning_path"))
+        return redirect(url_for("employee_learning_path"))
+    if not session.get("authenticated"):
+        return redirect(url_for("login", next=request.path))
     employees = rows("SELECT * FROM employees ORDER BY name")
     roles = rows("SELECT * FROM roles ORDER BY name")
     employee_id = int(request.args.get("employee_id", employee_id or (employees[0]["id"] if employees else 0)))
@@ -137,11 +529,74 @@ def learning_path_page(employee_id):
     selected_role = row("SELECT * FROM roles WHERE id=?", (role_id,)) if role_id else None
     return render_template("learning_path.html", employees=employees, employee=selected_employee, roles=roles, selected_role=selected_role, path=learning_path(employee_id, role_id) if selected_employee and role_id else [], recommendations=recommendations(employee_id, role_id) if selected_employee and role_id else [])
 
+
+@app.get("/hr/learning-path/<int:employee_id>")
+def hr_learning_path(employee_id):
+    if not session.get("authenticated"):
+        return redirect(url_for("login", next=request.path))
+    employee = row("SELECT e.* FROM employees e JOIN assessment_requests ar ON ar.employee_id=e.id WHERE e.id=? AND ar.status IN ('Completed', 'Reviewed')", (employee_id,))
+    roles = rows("SELECT * FROM roles ORDER BY name")
+    if not employee or not roles:
+        flash("A completed assessment and available role are required.", "warning")
+        return redirect(url_for("hr_assessments"))
+    profile = row("SELECT target_role_id FROM employee_profiles WHERE employee_id=?", (employee_id,))
+    requested_role_id = request.args.get("role_id")
+    role_id = int(requested_role_id) if requested_role_id else int(profile["target_role_id"] if profile and profile["target_role_id"] else roles[0]["id"])
+    selected_role = row("SELECT * FROM roles WHERE id=?", (role_id,))
+    if not selected_role:
+        flash("That target role could not be found.", "warning")
+        return redirect(url_for("hr_learning_path", employee_id=employee_id))
+    return render_template("learning_path.html", employees=[employee], employee=employee, roles=roles, selected_role=selected_role, result=analyze(employee_id, role_id), path=learning_path(employee_id, role_id), recommendations=recommendations(employee_id, role_id), is_employee_view=False)
+
+
+@app.get("/employee/learning-path")
+def employee_learning_path():
+    employee = employee_from_session()
+    if not employee:
+        return redirect(url_for("employee_login", next=request.path))
+    completed = row("SELECT id FROM assessment_requests WHERE employee_id=? AND status IN ('Completed', 'Reviewed') ORDER BY id DESC LIMIT 1", (employee["id"],))
+    profile = row("SELECT target_role_id FROM employee_profiles WHERE employee_id=?", (employee["id"],))
+    roles = rows("SELECT * FROM roles ORDER BY name")
+    if not completed or not profile or not profile["target_role_id"]:
+        flash("Submit an assessment with a target role before viewing a learning path.", "info")
+        return redirect(url_for("employee_dashboard"))
+    selected_role = row("SELECT * FROM roles WHERE id=?", (profile["target_role_id"],))
+    return render_template("learning_path.html", employees=[employee], employee=employee, roles=[selected_role] if selected_role else roles, selected_role=selected_role, result=analyze(employee["id"], profile["target_role_id"]) if selected_role else {}, path=learning_path(employee["id"], profile["target_role_id"]) if selected_role else [], recommendations=recommendations(employee["id"], profile["target_role_id"]) if selected_role else [], is_employee_view=True)
+
 @app.route("/resources")
 def resources_page(): return render_template("resources.html", resources=rows("SELECT lr.*, s.name AS skill FROM learning_resources lr JOIN skills s ON s.id=lr.skill_id ORDER BY s.name, lr.name"), skills=rows("SELECT * FROM skills ORDER BY name"))
 
 @app.route("/analytics")
 def analytics(): return render_template("analytics.html", metrics=dashboard_metrics())
+
+@app.get("/hr/analytics")
+def hr_analytics():
+    if not session.get("authenticated"):
+        return redirect(url_for("login", next=request.path))
+    return render_template("hr_analytics.html", analytics=organization_analytics())
+
+
+@app.get("/hr/reports")
+def hr_reports():
+    if not session.get("authenticated"):
+        return redirect(url_for("login", next=request.path))
+    return render_template("hr_reports.html", analytics=organization_analytics())
+
+
+@app.get("/hr/reports.csv")
+def hr_reports_csv():
+    if not session.get("authenticated"):
+        return redirect(url_for("login", next=request.path))
+    report = organization_analytics()
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Employee", "Employee ID", "Department", "Current Role", "Target Role", "Readiness", "Development Status", "Top Skill Gaps", "Learning Areas"])
+    for employee in report["employees"]:
+        writer.writerow([employee["name"], employee["id"], employee["department"], employee["current_role"], employee["target_role"], employee["readiness"], employee["readiness_label"], "; ".join(item["skill"] for item in employee["top_gaps"]), employee["learning_count"]])
+    response = make_response(output.getvalue())
+    response.headers["Content-Type"] = "text/csv; charset=utf-8"
+    response.headers["Content-Disposition"] = "attachment; filename=skillpath-hr-report.csv"
+    return response
 
 @app.route("/configuration")
 def configuration(): return render_template("configuration.html", skills=rows("SELECT * FROM skills ORDER BY name"), roles=rows("SELECT * FROM roles ORDER BY name"), role_skills={role["id"]: rows("SELECT s.name, rs.required_level FROM role_skills rs JOIN skills s ON s.id=rs.skill_id WHERE rs.role_id=?", (role["id"],)) for role in rows("SELECT id FROM roles")})
@@ -150,11 +605,17 @@ def notifications_data():
     first_employee = row("SELECT id, name FROM employees ORDER BY id LIMIT 1")
     low_skill_count = row("SELECT COUNT(*) AS count FROM employee_skills WHERE proficiency < 35")
     latest_resource = row("SELECT name FROM learning_resources ORDER BY id DESC LIMIT 1")
-    return [
+    notifications = [
         {"icon": "exclamation-triangle", "title": "Training focus identified", "message": f"{low_skill_count['count']} skill baselines are below 35%.", "time": "Current analysis"},
         {"icon": "signpost-split", "title": "Learning path ready", "message": f"A path is available for {first_employee['name']}." if first_employee else "Add an employee to generate a path.", "time": "Based on current data"},
         {"icon": "collection-play", "title": "Resource library updated", "message": f"Latest resource: {latest_resource['name']}." if latest_resource else "No resources available.", "time": "Resource catalog"},
     ]
+    for item in rows("SELECT n.*, e.name AS employee_name FROM notifications n LEFT JOIN employees e ON e.id=n.recipient_id WHERE n.recipient_role='HR' ORDER BY n.created_at DESC, n.id DESC LIMIT 10"):
+        item["icon"] = "clipboard-check"
+        item["time"] = item["created_at"]
+        item["action_url"] = url_for("hr_assessment_review", employee_id=item["recipient_id"]) if item["recipient_id"] else None
+        notifications.insert(0, item)
+    return notifications[:10]
 
 @app.get("/api/notifications")
 def api_notifications(): return jsonify(notifications_data())
